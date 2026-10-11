@@ -1,0 +1,91 @@
+# Keep the `burn-aware` branch current with upstream main.
+#
+# `burn-aware` is a single commit on top of realiti4/claude-swap main that
+# carries the burn-aware autoswitch patch (see that commit's message). It is
+# installed with
+#   uv tool install --with rumps 'claude-swap @ git+https://github.com/mvzink/claude-swap@burn-aware'
+# and `uv tool upgrade claude-swap` (which `cswap upgrade` runs) re-fetches the
+# branch tip -- so the branch only moves when this job rebases it. Without a
+# schedule the install would freeze at whatever the branch was the day it was
+# created.
+#
+# A conflict here means upstream touched the lines the patch rewrites. That is
+# the intended failure mode: the job files/updates an issue and stops, rather
+# than pushing a branch that no longer applies (and thereby breaking every
+# future `uv tool upgrade`).
+name: rebase burn-aware onto upstream main
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily, 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: burn-aware
+          fetch-depth: 0
+
+      - name: Is a rebase needed?
+        id: check
+        run: |
+          git remote add upstream https://github.com/realiti4/claude-swap.git
+          git fetch --quiet upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "needed=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase onto upstream/main
+        if: steps.check.outputs.needed == 'true'
+        id: rebase
+        run: |
+          git config user.name "burn-aware bot"
+          git config user.email "burn-aware-bot@users.noreply.github.com"
+          if git rebase upstream/main; then
+            git push --force-with-lease origin burn-aware
+          else
+            git rebase --abort || true
+            echo "conflict=true" >>"$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: File an issue when the patch no longer applies
+        if: failure() && steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="burn-aware patch no longer rebases onto upstream main"
+          body="$(printf '%s\n' \
+            'The daily rebase of `burn-aware` onto `realiti4/claude-swap@main` conflicted.' \
+            '' \
+            'The patch touches `src/claude_swap/{poll_policy,autoswitch,switcher}.py`.' \
+            'The branch has therefore frozen at its last good commit: installs keep' \
+            'working but stop receiving upstream fixes until this is re-rolled.' \
+            '' \
+            'Re-roll it locally, then force-push the branch:' \
+            '' \
+            '```' \
+            'jj git clone --colocate https://github.com/mvzink/claude-swap' \
+            '# rebase the burn-aware change onto main@origin, re-apply the patch by hand,' \
+            '# then:' \
+            'jj git push -b burn-aware' \
+            '```' \
+            '' \
+            "Run: $RUN_URL")"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

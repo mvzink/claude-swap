@@ -142,6 +142,27 @@ POST_429_MAX_INTERVAL_S = 1800.0
 # cadence keys on the same band, so it lives with the cadence numbers).
 ESCALATION_MARGIN_PCT = 15.0
 
+# --- burn-rate catch-up ----------------------------------------------------
+# A rate is only measurable from two samples close enough together that the
+# delta is the workload rather than bookkeeping. Below the floor the delta is
+# inside the store's own noise; above the ceiling the samples straddle a window
+# reset or a sleep, and the ratio is meaningless either way.
+BURN_RATE_MIN_DT_S = 30.0
+BURN_RATE_MAX_DT_S = 1800.0
+# A rate this small is indistinguishable from idle: catch-up would ask for an
+# interval above the ceiling anyway.
+BURN_RATE_MIN_PCT_PER_MIN = 0.01
+# Catch-up fires once the headroom left is worth no more than this many poll
+# intervals of measured burn. At 1.0 the next poll lands exactly on the
+# threshold; 2.0 therefore buys one whole interval of slack, which is the
+# smallest unit that can close the gap the reactive test leaves open.
+BURN_MARGIN_INTERVALS = 2.0
+# Floor for the burn-derived trigger, as a utilization. Without it a very fast
+# burn over a long interval would compute a trigger at or below the account's
+# current utilization and switch on every tick regardless of the configured
+# threshold; with it, a hot account still gets one interval's worth of margin.
+BURN_EFFECTIVE_THRESHOLD_FLOOR_PCT = 50.0
+
 # Never schedule a poll later than a known window reset (+ slack): stored
 # usage is obsolete the moment the window rolls over.
 RESET_SLACK_S = 60.0
@@ -192,6 +213,187 @@ def parse_reset_ts(resets_at: str | None) -> float | None:
         return None
 
 
+def burn_effective_threshold_pct(
+    *,
+    threshold: float,
+    burn_pct_per_min: float | None,
+    interval_s: float,
+    models: tuple[str, ...],
+) -> float:
+    """The threshold a measured burn earns, in the unit the loop works in.
+
+    A threshold is a percentage of a window, but the engine can only test it
+    at a poll -- so a margin of ``100 - threshold`` points is a margin of
+    ``(100 - threshold) / burn`` seconds, while the reaction time is
+    ``interval_s``. Those two were never commensurate, and at the settings
+    this was reported on the mismatch was stark: 0.5 points of margin is
+    roughly 25% of *one* poll at a 2%/min burn, and about a second at the
+    99th-percentile burn. Measured on a real log, every overshoot that reached
+    100% with the engine still testing below the threshold did so with the
+    account already inside the escalation band and the cadence already at its
+    60s floor -- so no amount of faster polling closes it. The margin itself
+    was too small.
+
+    This returns ``threshold`` unchanged when no rate is measurable (the
+    degradation path is exactly the pre-existing engine), and otherwise
+    raises the effective trigger to leave ``BURN_MARGIN_INTERVALS`` intervals
+    of burn in hand: a switch at ``100 - burn x interval x K``. A slow account
+    is unaffected -- at 0.5%/min and 180s that is 3 points, so 97 rather than
+    99.5 -- which is the point: the trigger follows consumption instead of
+    assuming every account burns at the same rate.
+
+    Never lowers the configured threshold, and never raises the effective
+    trigger above ``100 - BURN_RATE_MIN_PCT_PER_MIN``: an account always gets
+    *some* margin before the line, however fast it burns.
+    """
+    if burn_pct_per_min is None or burn_pct_per_min <= 0:
+        return threshold
+    per_interval = burn_pct_per_min / 60.0 * interval_s * BURN_MARGIN_INTERVALS
+    if per_interval <= 0:
+        return threshold
+    # The burn overrides the configured value in BOTH directions -- that is the
+    # whole point: a hot account needs its trigger pulled closer, and one whose
+    # margin the configured threshold already covers (fast burn over a long
+    # interval, i.e. a small ``100 - per_interval``) keeps whichever is stricter.
+    # Bounded so an account always gets some margin before the hard limit.
+    return max(
+        BURN_EFFECTIVE_THRESHOLD_FLOOR_PCT,
+        min(threshold, 100.0 - per_interval),
+    )
+
+
+def burn_pct_per_min_from_pcts(
+    prev_pct: float | None,
+    new_pct: float | None,
+    *,
+    dt_s: float | None,
+) -> float | None:
+    """Percent-per-minute burn from two already-resolved binding percentages.
+
+    The single home of the measurability guards, shared by the collector (which
+    has two usage dicts) and the engine (which has two percentages remembered
+    from its own previous ticks).
+    """
+    if dt_s is None or dt_s <= 0:
+        return None
+    if dt_s < BURN_RATE_MIN_DT_S or dt_s > BURN_RATE_MAX_DT_S:
+        return None
+    if prev_pct is None or new_pct is None:
+        return None
+    delta = new_pct - prev_pct
+    if delta <= 0:
+        return None
+    rate = delta / (dt_s / 60.0)
+    if rate < BURN_RATE_MIN_PCT_PER_MIN:
+        return None
+    return rate
+
+
+def burn_pct_per_min(
+    prev_usage: dict | None,
+    new_usage: dict | None,
+    *,
+    dt_s: float | None,
+    models: tuple[str, ...],
+) -> float | None:
+    """Percent-per-minute burn of the binding window between two samples.
+
+    ``None`` whenever the rate is not trustworthy: no previous sample, an
+    unreadable binding window on either side, an interval outside
+    ``[BURN_RATE_MIN_DT_S, BURN_RATE_MAX_DT_S]`` (too close to read, or
+    straddling a reset/sleep), a non-positive interval, or a delta that is flat
+    or negative (an idle account, or a window that just rolled over). Callers
+    treat ``None`` as "unmeasured", never as zero burn.
+
+    Measured on the BINDING window rather than the 5h window alone, so a burn
+    led by the weekly or a scoped per-model window is not missed, and so the
+    rate and the threshold agree about what is being consumed.
+    """
+    return burn_pct_per_min_from_pcts(
+        binding_pct(prev_usage, models),
+        binding_pct(new_usage, models),
+        dt_s=dt_s,
+    )
+
+
+def burn_catchup_interval_s(
+    *,
+    prev_pct: float | None,
+    new_pct: float | None,
+    dt_s: float | None,
+    interval_s: float,
+    is_active: bool,
+    threshold: float,
+    recent_429: bool,
+    models: tuple[str, ...],
+) -> float | None:
+    """The faster interval a measured burn earns, or ``None`` to keep
+    ``interval_s``.
+
+    The threshold is a percentage of a window and the engine can only test it
+    at a poll, so a reactive test is late by up to one whole poll interval of
+    burn *by construction*. Measured on a real log, that is precisely the
+    budget the last points of headroom were being spent from: the median
+    sampling interval while the active account sat at 98-99% used was 240s
+    (2100s at the 90th percentile), while the median measured burn spent the
+    last 2 points in 240s and the 90th percentile spent them in 45s. The
+    margin and the reaction time were in different units, so the margin was
+    gone before the test could run.
+
+    This makes the margin a *time* margin, in the unit the loop actually
+    works in: keep the headroom worth at least ``BURN_MARGIN_INTERVALS`` poll
+    intervals of measured burn, and ask to be polled at a fraction of the time
+    that headroom takes to spend, so the next reading still has margin left
+    when it arrives rather than landing exactly on the line. A slow account
+    that is merely *near* the threshold is untouched -- it keeps the ordinary
+    cadence and the percentage test, which is not late for it by more than it
+    can afford.
+
+    The result is clamped to ``[MIN_INTERVAL_S, interval_s]``:
+
+      * never longer than what the caller already chose (only ever speeds up),
+      * never shorter than ``MIN_INTERVAL_S``, the cadence floor the
+        ~28-30-req/hour usage-endpoint budget was measured against. Sub-floor
+        polling stays the existing urgent tier's job (it fires at 60s when a
+        single poll catches ``MOVEMENT_DELTA_PCT`` of movement), so this
+        **adds no new budget pressure**: it only pulls a decayed cadence back
+        toward the floor when a burn justifies it.
+
+    ``recent_429`` suppresses it outright: a throttled token must accumulate
+    budget, and billing a catch-up poll against a saturated window is how the
+    *next* real reading gets refused (upstream issue #208).
+    """
+    if recent_429 or not is_active:
+        return None
+    if prev_pct is None or new_pct is None or new_pct <= prev_pct:
+        return None
+    if dt_s is None or dt_s < BURN_RATE_MIN_DT_S or dt_s > BURN_RATE_MAX_DT_S:
+        return None
+    burn = (new_pct - prev_pct) / (dt_s / 60.0)
+    if burn < BURN_RATE_MIN_PCT_PER_MIN:
+        return None
+    headroom_pct = 100.0 - new_pct
+    if headroom_pct <= 0:
+        return None
+    # Only the band the decision already escalates in: outside it there is no
+    # crossing to catch up to, and the ordinary cadence is cheaper. This is a
+    # precondition, not a floor -- a slow account sitting inside the band is
+    # still left alone by the time test below.
+    if headroom_pct > ESCALATION_MARGIN_PCT:
+        return None
+    # burn is percent per MINUTE and interval_s is in seconds: convert before
+    # comparing, or the margin is 60x too generous and every slow account
+    # inside the band gets tightened.
+    margin_pct = burn / 60.0 * interval_s * BURN_MARGIN_INTERVALS
+    if headroom_pct > margin_pct:
+        return None
+    # Aim to arrive with the margin half spent: polling at the full
+    # time-to-exhaust would land exactly on 100%.
+    time_to_exhaust_s = headroom_pct / burn * 60.0
+    want = time_to_exhaust_s / BURN_MARGIN_INTERVALS
+    return min(interval_s, max(MIN_INTERVAL_S, want))
+
+
 def plan_after_fetch(
     *,
     prev_interval_s: float | None,
@@ -202,6 +404,7 @@ def plan_after_fetch(
     models: tuple[str, ...],
     recent_429: bool,
     now: float,
+    dt_s: float | None = None,
     rng: Callable[[], float] = random.random,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
@@ -212,7 +415,10 @@ def plan_after_fetch(
     escalation band. No movement backs off ×1.5 toward the account's ceiling;
     unknown utilization uses the default. A recent 429 on this token floors
     the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
-    until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
+    until ``RECENT_429_WINDOW_S`` has passed. ``dt_s`` is the wall time since
+    ``prev_usage`` was measured; with it, a measurable burn rate additionally
+    tightens the active account's cadence to ``burn_catchup_interval_s`` so the
+    threshold is not crossed between polls. The scheduled time gets
     ``JITTER_FRAC`` noise, is never later than the account's next window
     reset (+ ``RESET_SLACK_S``). An at-limit account keeps a bounded slow
     poll instead of sleeping until that reset, so an early provider-side
@@ -250,6 +456,21 @@ def plan_after_fetch(
         # budget. Floored at POST_429_MIN_INTERVAL_S for the first 429.
         increased = max(base * POST_429_BACKOFF_MULT, POST_429_MIN_INTERVAL_S)
         interval = min(POST_429_MAX_INTERVAL_S, max(interval, increased))
+    else:
+        # Burn-rate catch-up, after the movement/decay decision so it can only
+        # tighten it, and never inside a 429 window (see the helper).
+        catch_up = burn_catchup_interval_s(
+            prev_pct=prev_pct,
+            new_pct=new_pct,
+            dt_s=dt_s,
+            interval_s=interval,
+            is_active=is_active,
+            threshold=threshold,
+            recent_429=recent_429,
+            models=models,
+        )
+        if catch_up is not None:
+            interval = catch_up
 
     headroom = oauth.account_headroom(new_usage, models)
     if headroom is not None and headroom <= 0:

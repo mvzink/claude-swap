@@ -5207,6 +5207,16 @@ class ClaudeAccountSwitcher:
                 continue
             before = pre.get(num)
             recent_429 = before is not None and before.recent_429(now)
+            # Wall time between the two samples the burn rate is read from.
+            # ``fetched_at`` is when last_good was *measured*, not when it was
+            # last served, so a reading that sat in the store (a 429-frozen
+            # lower bound, an idle candidate) yields a dt the rate module
+            # rejects as unmeasurable rather than a plausible-looking rate
+            # computed across the gap.
+            prev_fetched_at = before.fetched_at if before else None
+            dt_s = (
+                now - prev_fetched_at if prev_fetched_at is not None else None
+            )
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,
                 prev_usage=before.last_good if before else None,
@@ -5216,6 +5226,7 @@ class ClaudeAccountSwitcher:
                 models=models,
                 recent_429=recent_429,
                 now=now,
+                dt_s=dt_s,
             )
         return plans
 

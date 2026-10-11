@@ -684,6 +684,13 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # Last observed (epoch, binding pct) for whichever account is active,
+        # used to derive a burn rate for the decision threshold. In-memory and
+        # engine-local on purpose: it needs no store schema change, and an
+        # engine restart simply degrades to the pre-existing percentage test
+        # for one tick rather than inventing a rate from a stale sample.
+        self._last_active_pct: tuple[float, float] | None = None
+        self._last_active_num: str | None = None
 
     # -- state file ---------------------------------------------------------
 
@@ -874,6 +881,52 @@ class AutoSwitchEngine:
             return False
         return slot_identity["uuid"] != ta_uuid
 
+    def _active_burn_pct_per_min(self, entry: "UsageEntry | None") -> float | None:
+        """Burn rate of the active account, in binding points per minute.
+
+        Read from the two most recent observations of the SAME account, so an
+        account change never manufactures a rate out of one account's reading
+        minus another's. The reading must also still be the one the entry is
+        serving (``fetched_at`` unchanged) -- a 429-frozen row re-served for an
+        hour must not look like an hour-old sample paired with a fresh one.
+
+        Returns ``None`` when the rate is unmeasurable, which the caller treats
+        as "keep the configured threshold".
+        """
+        if entry is None or entry.fetched_at is None:
+            return None
+        current = self.switcher.current_account_number()
+        if current is None:
+            return None
+        if self._last_active_num != current:
+            return None
+        if self._last_active_pct is None:
+            return None
+        prev_at, prev_pct = self._last_active_pct
+        if prev_at == entry.fetched_at:
+            # Same reading as last tick: nothing new to measure between.
+            return None
+        return poll_policy.burn_pct_per_min_from_pcts(
+            prev_pct,
+            poll_policy.binding_pct(entry.last_good, self._models),
+            dt_s=entry.fetched_at - prev_at,
+        )
+
+    def _remember_active_pct(
+        self, current: str, entry: "UsageEntry | None"
+    ) -> None:
+        """Record this tick's active observation for the next tick's rate."""
+        if entry is None or entry.fetched_at is None:
+            return
+        pct = poll_policy.binding_pct(entry.last_good, self._models)
+        if pct is None:
+            return
+        if self._last_active_num != current:
+            # New active account: start its series rather than differencing
+            # against the previous account's reading.
+            self._last_active_num = current
+        self._last_active_pct = (entry.fetched_at, pct)
+
     # -- tick -----------------------------------------------------------------
 
     def tick(self) -> TickOutcome:
@@ -972,12 +1025,32 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
+        # Read the rate BEFORE recording this tick's sample: the pair must be
+        # this tick's reading against the previous tick's, not the previous
+        # reading against itself.
+        active_burn = self._active_burn_pct_per_min(entries.get(current))
+        self._remember_active_pct(current, entries.get(current))
         active_headroom = headroom.get(current)
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            # The threshold the engine actually tests against. A configured
+            # threshold is a percentage of a window; what the loop needs is a
+            # margin it can act inside, so a measured burn rate raises the
+            # effective trigger to leave a couple of poll intervals of burn in
+            # hand (see poll_policy.burn_effective_threshold_pct). Unmeasured
+            # gives back ``settings.threshold`` exactly, so an idle or
+            # single-sample account behaves as before.
+            effective_threshold = poll_policy.burn_effective_threshold_pct(
+                threshold=settings.threshold,
+                burn_pct_per_min=active_burn,
+                interval_s=max(
+                    settings.interval_seconds, poll_policy.URGENT_INTERVAL_S
+                ),
+                models=self._models,
+            )
+            if utilization < effective_threshold:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
@@ -986,7 +1059,7 @@ class AutoSwitchEngine:
                             # display an impossible "100% < 99.9%".
                             detail=(
                                 f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                                f"{pct_label(effective_threshold)}%"
                             ),
                         )
                     )
